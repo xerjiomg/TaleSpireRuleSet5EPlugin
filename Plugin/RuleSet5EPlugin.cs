@@ -331,8 +331,7 @@ namespace LordAshes
         }
 
         //XJ:(2022/10/11) add:
-        public void LoadDnd5(CreatureBoardAsset instigator)
-        // public void LoadDnd5(MapMenuItem ar1, object ar2)
+        public void LoadDnd5(CreatureBoardAsset instigator)       
         {
             try
             {
