@@ -40,7 +40,7 @@ namespace LordAshes
                                 {
                                     modListText.text += "\n\nMods Currently Installed:\n";
                                 }
-                                modListText.text += "\nLord Ashes' " + bepInPlugin.Name + " - " + bepInPlugin.Version;
+                                modListText.text += "\n"+Author+"'s " + bepInPlugin.Name + " - " + bepInPlugin.Version;
                             }
                         }
                     }
@@ -83,9 +83,9 @@ namespace LordAshes
                 return (GetCharacterName(asset) == characterName);                
             }
 
-            public static List<string> FindGMs()
+            public static List<PlayerGuid> FindGMs()
             {
-                List<string> names = new List<string>();
+                List<PlayerGuid> names = new List<PlayerGuid>();
                 foreach (PlayerGuid player in CampaignSessionManager.PlayersInfo.Keys)
                 {
                     List<ClientGuid> list = new List<ClientGuid>();
@@ -93,24 +93,24 @@ namespace LordAshes
                     {
                         int count = list.Count;
                         for (int i = 0; i < count; i++)
-                        {
+                        {                            
                             ClientMode clientMode;
                             if (BoardSessionManager.ClientsModes.TryGetValue(list[i], out clientMode) && clientMode == ClientMode.GameMaster)
                             {
-                                names.Add(CampaignSessionManager.GetPlayerName(player));
+                                names.Add(player);
                             }
                         }
-                    }
+                    }              
                 }
-                return (names.Count > 0) ? names : new List<string>() { "None" };
+                return (names.Count > 0) ? names : new List<PlayerGuid>() ;
             }
-
-            public static List<string> FindOwners(CreatureGuid cid)
+            //Change string (name) for player guids (sym update)
+            public static List<PlayerGuid> FindOwners(CreatureGuid cid)
             {
-                List<string> owners = new List<string>();
+                List<PlayerGuid> owners = new List<PlayerGuid>();
                 foreach (PlayerGuid player in CampaignSessionManager.PlayersInfo.Keys)
                 {
-                    if(CreatureManager.PlayerCanControlCreature(player, cid)) { owners.Add(CampaignSessionManager.GetPlayerName(player)); }
+                    if(CreatureManager.PlayerCanControlCreature(player, cid)) { owners.Add(player); }
                 }
                 return owners;
             }
@@ -135,6 +135,7 @@ namespace LordAshes
 
             public static string GetCharacterName(string creatureName)
             {
+                if (creatureName == null) {return ""; }
                 string name = creatureName;
                 if (name.IndexOf("<") >= 0)
                 {

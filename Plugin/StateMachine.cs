@@ -4,24 +4,38 @@ using Bounce.Unmanaged;
 using BRClient;
 using GameChat.UI;
 using HarmonyLib;
+using JetBrains.Annotations;
 using Newtonsoft.Json.Linq;
 using SRF.Components;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Data;
+using System.Data.SqlTypes;
+using System.Drawing;
+using System.Drawing.Text;
 using System.Linq;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Windows.Forms;
 using Tantawowa.Extensions;
+using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.Device;
 using UnityEngine.EventSystems;
 using static LordAshes.RuleSet5EPlugin;
 
 namespace LordAshes
 {
-    public partial class RuleSet5EPlugin : BaseUnityPlugin
+    public class MultiDCAttackData
     {
+        public CreatureBoardAsset mVcitim { get; set; } = null;
+        public bool mHalfDamage { get; set; } =false;
+        public bool mReactionHalve { get; set; } = false;
+    }
+
+    public partial class RuleSet5EPlugin : BaseUnityPlugin
+    {       
         //XJ (2022/11/09) variable to set diagnostic detail level.
         public static DiagnosticMode diagnostics;
         // Scale
@@ -35,7 +49,7 @@ namespace LordAshes
         private Roll lastRollRequest = null;
         private RollTotal lastRollRequestTotal = RollTotal.normal;
         private Roll loadedRollRequest = null;
-        private int lastRollId = -2;
+        private long lastRollId = -2;
         private Dictionary<string, object> lastResult = null;
         private float damageDieMultiplier = 1.0f;
 
@@ -60,6 +74,9 @@ namespace LordAshes
         private ChatManager chatManager = null;
         private bool totalAdv = false;
         private bool totalDis = false;
+        //XJ: (2022/12/16) To use 
+        private bool victim_totalAdv = false;
+        private bool victim_totalDis = false;
         private bool useAttackBonusDie = false;
         private string amountAttackBonusDie = "";
         private bool useDamageBonusDie = false;
@@ -67,7 +84,10 @@ namespace LordAshes
         private bool useSkillBonusDie = false;
         private string amountSkillBonusDie = "";
         private bool victim_useSkillBonusDie = false;
+        private string amountACBonusDie = "";
+        private bool useACBonusDie = false;
         private string victim_amountSkillBonusDie = "";
+        private string victim_amountACBonusDie = "";
         private bool reactionStop = false;
         public static float processSpeed = 1.0f;
         private Existence diceSideExistance = null;
@@ -75,8 +95,18 @@ namespace LordAshes
         bool secureSuccess = false;
         //XJ (2022/10/18) New bool DC half damage on Successful Save.
         bool halfDamage = false;
-        //XJ (2022/11/27) New bool DC half damage on Successful Save.
+        //XJ (2022/11/27) New bool criticalImmunity .
         bool criticalImmunity = false;
+        //Multitarget DC attacks list
+        bool firstWithDamageBonus = false;
+        //XJ:(2023/03/08): Fix auxiliary camera bug after TS patch
+        GameObject dolly = null;
+        Camera camera = null;
+        //RenderTexture auxCameraTexture = new RenderTexture(UnityEngine.Device.Screen.width/4, UnityEngine.Device.Screen.height/4,  32);
+        RenderTexture auxCameraTexture = new RenderTexture(UnityEngine.Device.Screen.width , UnityEngine.Device.Screen.height , 32);
+
+
+        private List <MultiDCAttackData> multiDCAttackDataList = new List <MultiDCAttackData>();
 
         //XJ (2022/11/09)
         public enum DiagnosticMode
@@ -153,7 +183,7 @@ namespace LordAshes
             healingRollDieRollReport,
             healingRollDieValueReport,
             healingRollDieValueTake,
-            healingRollCleanup,    
+            healingRollCleanup,  
         }
 
         private IEnumerator Executor()
@@ -185,53 +215,59 @@ namespace LordAshes
                     // *******************
                     // * Attack Sequence *
                     // *******************
-                    case StateMachineState.attackAttackRangeCheck:                        
+                    case StateMachineState.attackAttackRangeCheck:
                         stateMachineState = StateMachineState.attackAttackIntention;
+                        if (healSequence) { stateMachineState = StateMachineState.healingRollStart; }
                         //XJ(2022/10/18) 
                         secureSuccess = false;
-                        halfDamage = false;
+                        halfDamage = false;             
                         //XJ Restore defaul secureSuccess state and half damage (DC Attacks).
                         float dist;
                         float reachAdjust = 0.5f; // (extra adjust)
                         //XJ: (2022/10/19)
                         if (CreatureManager.SnapToGrid)
-                        { 
-                            Vector3 vecresult = instigator.transform.position - victim.transform.position;                            
+                        {
+                            Vector3 vecresult = instigator.transform.position - victim.transform.position;
                             dist = scale * Math.Max(Math.Abs(vecresult[0]), Math.Max(Math.Abs(vecresult[1]), Math.Abs(vecresult[2]))); //XJ: Get the difference from each axis and use the max value. 
                             //XJ  (2022/10/18)                       
-                            dist = dist - (((instigator.Scale>=1) ? instigator.Scale : 1) - 1) * (scale / 2) - (((victim.Scale >= 1) ? victim.Scale : 1) - 1) * (scale / 2);
+                            dist = dist - (((instigator.Scale >= 1) ? instigator.Scale : 1) - 1) * (scale / 2) - (((victim.Scale >= 1) ? victim.Scale : 1) - 1) * (scale / 2);
                             //XJ Adjust distance according to creature's size. Size 1/2 works like 1
-                            dist = float.Parse(Math.Round(dist).ToString());                            
+                            dist = float.Parse(Math.Round(dist).ToString());
                         }
                         else
                         {
                             dist = (scale * Vector3.Distance(instigator.transform.position, victim.transform.position));
                             //XJ  (2022/10/18) 
                             if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Attack:" + dist + "|" + instigator.ScaledBaseRadius.ToString() + "|" + victim.ScaledBaseRadius.ToString() + "|" + scale.ToString()); }
-                            dist = dist - ((instigator.ScaledBaseRadius + victim.ScaledBaseRadius)* scale - scale);
+                            dist = dist - ((instigator.ScaledBaseRadius + victim.ScaledBaseRadius) * scale - scale);
                             if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Attack: dist : " + dist); }
                             //XJ Adjust distance according to creature's size.
                         }
                         //XJ: On Sntap to grid. Distance measure on grid squares.(The grid is snap to the axis)                      
 
                         if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Attack: Ran-+ge=" + dist); }
-                        
+
                         int attackRange = (lastRollRequest.type.ToUpper() == "MELEE" & lastRollRequest.range == "0/0") ? characters[Utility.GetCharacterName(instigator)].reach : int.Parse(lastRollRequest.range.Split('/')[1]);
                         if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("distancia:" + dist.ToString() + "attackrange + adjust:" + (attackRange + reachAdjust).ToString() + "atacck range:" + attackRange.ToString() + "adjust:" + reachAdjust.ToString()); ; }
                         if (dist > (attackRange + reachAdjust))
                         {
                             StartCoroutine(DisplayMessage(Utility.GetCharacterName(instigator) + " cannot reach " + Utility.GetCharacterName(victim) + " at " + dist + "' with " + lastRollRequest.name + " (Range: " + attackRange + "')", 1.0f));
+                            if (victim != null) { victim.SetGlow(false, UnityEngine.Color.red); }
+
                             stateMachineState = StateMachineState.idle;
+                            
+                            if (multiTargetAssets.Count != MultitargetAssetsIndex) { if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Cannot reach Multi"); }; StartSequencePre(multiAttackType, multiRoll, instigator.CreatureId, null, null); }
                         }
                         else if ((lastRollRequest.type.ToUpper() == "RANGE") || (lastRollRequest.type.ToUpper() == "RANGED") || (lastRollRequest.type.ToUpper() == "MAGIC"))
                         {
                             attackRange = int.Parse(lastRollRequest.range.Split('/')[0]);
                             if (dist <= (attackRange + reachAdjust))  //XJ (2022/10/19): Change 2.0f > reachAdjust
                             {
-                                foreach (CreatureBoardAsset asset in CreaturePresenter.AllCreatureAssets)
+                                
+                                foreach (CreatureBoardAsset asset in CreaturePresenter.GetTempReadOnlyViewOfAllCreatureAssets())
                                 {
                                     int reach = 5;
-                                    bool npc = true;                                    
+                                    bool npc = true;
                                     if (characters.ContainsKey(Utility.GetCharacterName(asset)))
                                     {
                                         npc = characters[Utility.GetCharacterName(asset)].NPC;
@@ -242,21 +278,23 @@ namespace LordAshes
                                     if (npc && (dist < (reach + reachAdjust)) && (instigator.CreatureId != asset.CreatureId)) //XJ (2022/10/19): Change 2.0f > reachAdjust
                                     {
                                         StartCoroutine(DisplayMessage(Utility.GetCharacterName(instigator) + " is with " + reach + "' reach of " + Utility.GetCharacterName(asset) + ". Disadvantage on ranged attacks.", 1.0f));
-                                        lastRollRequestTotal = RollTotal.disadvantage;
+                                        //lastRollRequestTotal = RollTotal.disadvantage;
                                     }
                                 }
                             }
                             else
                             {
                                 StartCoroutine(DisplayMessage(Utility.GetCharacterName(instigator) + " requires a long range shot (" + attackRange + "'+) to reach of " + Utility.GetCharacterName(victim) + " at " + dist + "'. Disadvantage on ranged attacks.", 1.0f));
-                                lastRollRequestTotal = RollTotal.disadvantage;  
+                                //lastRollRequestTotal = RollTotal.disadvantage;
                             }
                         }
+                        
                         break;
                     case StateMachineState.attackAttackIntention:
                         stateMachineState = StateMachineState.attackRollSetup;
                         instigator.SpeakEx("Attack!");
-                        players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + " targets " + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=4>\r\n";
+                        
+                        players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "] <size=28>Attacks " + RuleSet5EPlugin.Utility.GetCharacterName(victim);
                         owner = players;
                         gm = players;
                         chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, LocalClient.Id.Value);
@@ -270,7 +308,7 @@ namespace LordAshes
                     case StateMachineState.attackRollSetup:
                         stateMachineState = StateMachineState.attackAttackDieCreate;
                         RollSetup(dm, ref stepDelay);
-                        if (rollingSystem == RollMode.automaticDice) { GameObject.Find("dolly").transform.position = new Vector3(-100f, 2f, -1.5f); }
+                        if (rollingSystem == RollMode.automaticDice) { dolly.transform.position = new Vector3(-100f, 2f, -1.5f); }
                         damageDieMultiplier = 1.0f;
                         break;
                     case StateMachineState.attackAttackDieCreate:
@@ -281,20 +319,36 @@ namespace LordAshes
                             //XJ(2022/10/17) 
                             if (lastRollRequest.roll.Contains("/"))
                             {
+                                bool havedata = false;
                                 foreach (Roll roll in characters[Utility.GetCharacterName(victim)].saves)
                                 {
                                     if (roll.name.ToUpper() == lastRollRequest.roll.Split('/')[1].ToUpper())
                                     {
                                         RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(lastRollRequest.name) + ":" + roll.roll, ref stepDelay);
+                                        havedata = true;
+                                        break;
                                     }
                                 }
+                                if (havedata == false)
+                                {
+                                    foreach (Roll roll in characters[Utility.GetCharacterName(victim)].skills)
+                                    {
+                                        if (roll.name.ToUpper().Contains(lastRollRequest.roll.Split('/')[1].ToUpper()))
+                                        {
+                                            RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(lastRollRequest.name) + ":" + roll.roll, ref stepDelay);
+                                            havedata = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (havedata == false) { RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(lastRollRequest.name) + ":" + "1d20", ref stepDelay); SystemMessage.DisplayInfoText("Victim dont have:" + lastRollRequest.roll.Split('/')[1].ToString(), 4.0f); if (diagnostics >= DiagnosticMode.high) { Debug.Log("RuleSet 5E Plugin: " + "Victim dont have: " + lastRollRequest.roll.Split('/')[1].ToString()); }; }
                             }
-                            else                             
+                            else
                             {
                                 secureSuccess = true;
                                 stateMachineState = StateMachineState.attackAttackBonusDieReaction;
                                 if (diagnostics >= DiagnosticMode.high) { Debug.Log("RuleSet 5E Plugin: Secure Success (DC Attack)"); }
-                            }                                
+                            }
                         }
                         //XJ: get enemy Save roll on DC Attacks.
                         else
@@ -337,12 +391,8 @@ namespace LordAshes
                             useAttackBonusDie = victim_useSkillBonusDie;  // useAttackBonusDie = characters[Utility.GetCharacterName(victim)]._usingSkillBonus;
                             amountAttackBonusDie = victim_amountSkillBonusDie;  // amountAttackBonusDie = characters[Utility.GetCharacterName(victim)]._usingSkillBonusAmonunt;
                         }
-                        //XJ: get save defense bonus in DC attacks. 
-                        //XJ: (2022/10/18)
-                        lastResult["Expanded"] = lastResult["Expanded"].ToString().Replace("+-", "-");
-                        lastResult["Roll"] = lastResult["Roll"].ToString().Replace("+-", "-");
-                        //XJ: To fix  +- to -
-                        if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: UseAttackBonusDie: "+ useAttackBonusDie.ToString()+ " mountAttackBonusDie: " + amountAttackBonusDie.ToString()); }
+                        //XJ: get save defence bonus in DC attacks.  
+                        if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: UseAttackBonusDie: " + useAttackBonusDie.ToString() + " mountAttackBonusDie: " + amountAttackBonusDie.ToString()); }
                         if (useAttackBonusDie & amountAttackBonusDie != "")
                         {
                             hold = lastResult;
@@ -350,7 +400,9 @@ namespace LordAshes
                             {
                                 // AttackBonus is a Die Roll
                                 //XJ: (2022/10/07) Added new codeline: 
-                                dm.ClearAllDice(lastRollId);
+                                RollId.TryParse(lastRollId.ToString(), out RollId idLastroll2);                               
+                                dm.ClearDiceRoll(idLastroll2);
+                                
                                 //XJ: To clear previus rolls.
                                 stateMachineState = StateMachineState.attackAttackBonusDieWaitCreate;
                                 RollCreate(dt, $"talespire://dice/" + SafeForProtocolName("Bonus Die") + ":" + amountAttackBonusDie, ref stepDelay);
@@ -374,36 +426,39 @@ namespace LordAshes
                         // Callback propagates to next phase
                         break;
                     case StateMachineState.attackAttackBonusDieReaction:
-                        stateMachineState = StateMachineState.attackAttackDieRollReport;                 
+                        stateMachineState = StateMachineState.attackAttackDieRollReport;
                         //XJ: (2022 / 10 / 17) 
                         if (secureSuccess) { stateMachineState = StateMachineState.attackAttackHitReport; }
                         //XJ: Allow secure Success
-                        dm.ClearAllDice(lastRollId);
+                        RollId.TryParse(lastRollId.ToString(), out RollId idLastroll);
+                        dm.ClearDiceRoll(idLastroll);
                         //XJ:(2022/10/17) new condition Secure attack.                        
                         if (useAttackBonusDie & amountAttackBonusDie != "" & secureSuccess == false)
                         {
                             if (diagnostics >= DiagnosticMode.high) { Debug.Log("Adding Bonus Die"); }
-                            //XJ: (2022/10/04) (2022/10/05)
-                            //hold["Total"] = ((int)hold["Total"] + (int)lastResult["Total"]);
-                            //hold["Expanded"] = hold["Expanded"] + (("+-".Contains(lastResult["Expanded"].ToString().Substring(0, 1))) ? lastResult["Expanded"].ToString() : "+" + lastResult["Expanded"].ToString());
-                            //changed by                          
-                            if (amountAttackBonusDie.ToUpper().Contains("D") & "-".Contains(amountAttackBonusDie.Substring(0, 1)) & loadedRollRequest == null)
+
+                            hold["Total"] = ((int)hold["Total"] + (int)lastResult["Total"]);
+
+                            //if ( "-".Contains(lastResult["Roll"].ToString().Substring(0, 1)) & loadedRollRequest == null)
+                            if ( "-".Contains(lastResult["Expanded"].ToString().Substring(0, 1)) & loadedRollRequest == null)
                             {
-                                hold["Total"] = ((int)hold["Total"] - (int)lastResult["Total"]);
-                                hold["Expanded"] = hold["Expanded"] + "-" + lastResult["Expanded"].ToString().Replace("-", "+").Replace("++", "-");
+                                //hold["Expanded"] = hold["Expanded"] +"-"+ lastResult["Expanded"].ToString();
+                                hold["Expanded"] = hold["Expanded"] + lastResult["Expanded"].ToString();
                             }
-                            else
+                            else 
                             {
-                                hold["Total"] = ((int)hold["Total"] + (int)lastResult["Total"]);
-                                hold["Expanded"] = hold["Expanded"] + (("+-".Contains(lastResult["Expanded"].ToString().Substring(0, 1))) ? lastResult["Expanded"].ToString().Replace("+-", "-") : "+" + lastResult["Expanded"].ToString().Replace("+-", "-"));
+                                hold["Expanded"] = hold["Expanded"] + "+" + lastResult["Expanded"].ToString();
                             }
+                            //hold["Expanded"] = hold["Expanded"] + (("+-".Contains(lastResult["Expanded"].ToString().Substring(0, 1))) ? lastResult["Expanded"].ToString().Replace("+-", "-") : "+" + lastResult["Expanded"].ToString().Replace("+-", "-"));
+
+                            //}
                             //XJ: To allow negative roll bonus dice attack and solve chat visual problems with expanded string in this case (2022/10/05): when rolltype not is automaticGenerator.
 
-                            hold["Roll"] = hold["Roll"] + (("+-".Contains(amountAttackBonusDie.Substring(0, 1))) ? amountAttackBonusDie : "+" + amountAttackBonusDie);
+                            hold["Roll"] = hold["Roll"] + (("+-".Contains(lastResult["Roll"].ToString().Substring(0, 1))) ? lastResult["Roll"].ToString() : "+" + lastResult["Roll"].ToString());
                             lastResult = hold;
                             if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Bonus Die Added"); }
-                        }         
-                        
+                        }
+                        criticalImmunity = false;
                         if (secureSuccess == false && (bool)lastResult["IsMax"] == true & characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].immunity.Contains("critical")) //XJ (2022/11/27) Crítical immunity
                         {
                             if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Critical immunity "); }
@@ -413,21 +468,7 @@ namespace LordAshes
                         if (reactionStop)
                         {
                             stateMachineState = StateMachineState.attackAttackBonusDieReactionWait;
-                            //XJ: (2022/10/08) commented
-                            //string dice = lastResult["Expanded"].ToString();
-                            //int rollTotal = 0;
-                            //while(dice.Contains("["))
-                            //{
-                            //    string part = dice.Substring(dice.IndexOf("[") + 1);
-                            //    part = part.Substring(0,part.IndexOf("]"));
-                            //    dice = dice.Substring(dice.IndexOf("]")+1);
-                            //    string[] parts = part.Split(',');
-                            //    foreach(string die in parts)
-                            //    {
-                            //        rollTotal = rollTotal + int.Parse(die);
-                            //    }
-                            //}
-                            //reactionRollTotal = rollTotal;                            
+                             
                             reactionStopContinue = true;
                             //XJ:(2022/10/13)
                             if (secureSuccess)
@@ -448,7 +489,7 @@ namespace LordAshes
                             //XJ: (2022/10/08) To show total attack and not only dice roll.
                         }
                         break;
-                    case StateMachineState.attackAttackBonusDieReactionWait:                   
+                    case StateMachineState.attackAttackBonusDieReactionWait:
                         break;
                     case StateMachineState.attackAttackDieRollReport:
                         stateMachineState = StateMachineState.attackAttackDefenceCheck;
@@ -460,9 +501,11 @@ namespace LordAshes
                             int dieresult = int.Parse(lastResult["Expanded"].ToString().Substring(lastResult["Expanded"].ToString().IndexOf("[") + 1, lastResult["Expanded"].ToString().IndexOf("]") - 1).Split(',')[0]);
                             if (totalAdv || totalDis)
                             {
+                                if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 1 - Expanded: "+ lastResult["Expanded"]); }
                                 if (totalAdv & int.Parse(lastResult["Expanded"].ToString().Substring(lastResult["Expanded"].ToString().IndexOf("[") + 1, lastResult["Expanded"].ToString().IndexOf("]") - 1).Split(',')[1]) > dieresult)
                                 {
                                     dieresult = int.Parse(lastResult["Expanded"].ToString().Substring(lastResult["Expanded"].ToString().IndexOf("[") + 1, lastResult["Expanded"].ToString().IndexOf("]") - 1).Split(',')[1]);
+                                    if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 1Bis - Expanded: " + dieresult); }
                                 }
                                 if (totalDis & int.Parse(lastResult["Expanded"].ToString().Substring(lastResult["Expanded"].ToString().IndexOf("[") + 1, lastResult["Expanded"].ToString().IndexOf("]") - 1).Split(',')[1]) < dieresult)
                                 {
@@ -470,9 +513,10 @@ namespace LordAshes
                                 }
                             }
                             if (dieresult >= int.Parse(lastRollRequest.critrangemin))
-                            {  
+                            {
+                                if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 2"); }
                                 lastResult["IsMax"] = true;
-                                
+
                                 if (characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].immunity.Contains("critical")) //XJ: (2022/11/29) critical immunity
                                 {
                                     criticalImmunity = true;
@@ -483,12 +527,14 @@ namespace LordAshes
                         }
                         else
                         {
+                            if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 3"); }
                             lastResult["IsMax"] = false;
                             lastResult["IsMin"] = false;
                         }
                         //XJ: end if: no critical on Dc attacks.
                         if ((bool)lastResult["IsMax"] == true)
                         {
+                            if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 4"); }
                             if (criticalImmunity == true)
                             {
                                 instigator.SpeakEx(lastRollRequest.name + " " + lastResult["Total"] + " (Critical Immunity)");
@@ -496,10 +542,11 @@ namespace LordAshes
                             else
                             {
                                 instigator.SpeakEx(lastRollRequest.name + " " + lastResult["Total"] + " (Critical Hit)");
-                            }                                
+                            }
                         }
                         else if ((bool)lastResult["IsMin"] == true)
                         {
+                            if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 5"); }
                             instigator.SpeakEx(lastRollRequest.name + " " + lastResult["Total"] + " (Critical Miss)");
                         }
                         else
@@ -507,7 +554,8 @@ namespace LordAshes
                             //XJ: (2022/10/13)
                             if (dcAttack)
                             {
-                                victim.SpeakEx("Save: " + lastResult["Total"] + " VS " + lastRollRequest.roll.Split('/')[1].ToString() +" ("+ lastRollRequest.name+ ")");
+                                if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 6"); }
+                                victim.SpeakEx("Save: " + lastResult["Total"] + " VS " + lastRollRequest.roll.Split('/')[1].ToString() + " (" + lastRollRequest.name + ")");
                             }
                             else
                             {
@@ -518,101 +566,110 @@ namespace LordAshes
                         //XJ(2022/10/13) new if, dc attacks:
                         if (dcAttack)
                         {
+                            if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 7"); }
                             players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]";
-                            players = players + "<size=32>" + "Save: " + lastResult["Total"] + " VS " + lastRollRequest.roll.Split('/')[1].ToString() +" ("+ lastRollRequest.name+ ")" + "\r\n";
+                            players = players + "<size=28>" + "Save: " + lastResult["Total"] + " VS " + lastRollRequest.roll.Split('/')[1].ToString() + " (" + lastRollRequest.name + ")" + "\r\n";
                         }
                         else
                         {
                             players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]";
-                            players = players + "<size=32>" + lastRollRequest.name + " " + lastResult["Total"] + "\r\n";
+                            players = players + "<size=28>" + "Attack: " + lastResult["Total"] + " VS AC (" + lastRollRequest.name + ")\r\n";
                         }
                         //XJ end if.
 
                         owner = players;
                         owner = owner + "<size=16>" + lastResult["Roll"] + " = ";
                         owner = owner + "<size=16>" + lastResult["Expanded"];
+                        if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Prueba 8"); }
                         if ((bool)lastResult["IsMax"] == true)
                         {
                             owner = owner + " (Critical Hit)";
                         }
                         else if (criticalImmunity == true) //XJ (2022/11/27) Crítical immunity
                         {
-                            owner = owner + " (Critical Hit) [Critical Immunity]";                         
+                            owner = owner + " (Critical Hit) [Critical Immunity]";
                         }
                         else if ((bool)lastResult["IsMin"] == true)
                         {
                             owner = owner + " (Critical Miss)";
                         }
                         gm = owner;
-                        chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, new Bounce.Unmanaged.NGuid(LocalClient.Id.ToString()));
+                        
+                        if (dcAttack) { chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value); }                                                
+                        else { chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, LocalClient.Id.Value); }                        
+                        
                         stepDelay = 1.0f;
                         break;
                     case StateMachineState.attackAttackDefenceCheck:
                         if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Getting Total from '" + lastResult["Total"] + "'"); }
                         int attack = (int)lastResult["Total"];
-                        //XJ: CHARGE CA FROM DND5E INSTEAD VICTIM STAT
+                        //XJ: Get CA from Dnd5e isnead victim stat
                         //int ac = (int)(victim.Stat0.Value);
-                        int ac = int.Parse(characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].ac);
+                        int ac = int.Parse(characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].ac) + (victim_amountACBonusDie != "" ? int.Parse(victim_amountACBonusDie):0);
                         //XJ: Charge CA from dnd5e instead TS stat.
-                        //XJ (2022/10/13) if, dc attacks.                        
-                        if (dcAttack) {ac = int.Parse(lastRollRequest.roll.Split('/')[0]);}
+                        //XJ (2022/10/13) if, dc attacks.                         
+                        if (dcAttack) { ac = int.Parse(lastRollRequest.roll.Split('/')[0]); }
                         //XJ end if.                        
                         if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("Getting Min from '" + lastResult["IsMin"] + "'"); }
                         //XJ: (2022/10/04) if ((attack < ac) || ((bool)lastResult["IsMin"] == true))  Change by:                        
                         if ((attack < ac & (bool)lastResult["IsMax"] == false & dcAttack == false) || ((bool)lastResult["IsMin"] == true) || (dcAttack == true & attack >= ac))
                         //XJ: to secure a hit when critical
                         {
-                            stateMachineState = StateMachineState.attackAttackMissReport;                                                            
-                            
+                            stateMachineState = StateMachineState.attackAttackMissReport;
+
                             //XJ: 2022/10/18
-                            if (dcAttack & lastRollRequest.roll.Contains("/")) 
+                            if (dcAttack & lastRollRequest.roll.Contains("/"))
                             {
-                                if (lastRollRequest.roll.Split('/')[2].ToUpper() == "HALF") { halfDamage = true; stateMachineState = StateMachineState.attackAttackHitReport; }                                
+                                if (lastRollRequest.roll.Split('/')[2].ToUpper() == "HALF") { halfDamage = true; stateMachineState = StateMachineState.attackAttackHitReport; }
                             }
                             //XJ: Allow Half Damage on miss Dc attacks.
                         }
                         else
-                        {  
+                        {
                             stateMachineState = StateMachineState.attackAttackHitReport;
                         }
                         stepDelay = 0f;
                         break;
                     case StateMachineState.attackAttackMissReport:
-                        stateMachineState = StateMachineState.attackRollCleanup;                        
+                        stateMachineState = StateMachineState.attackRollCleanup;
                         victim.StartTargetEmote(instigator, missAnimation); //XJ (2022/12/04)  Animation after reaction.
-                        instigator.Attack(victim.CreatureId, victim.transform.position); 
-                        victim.SpeakEx("Miss!");
-                        players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + " Evades]<size=4>";
-                        owner = players;
+                        //instigator.Attack(CreatureBoardAsset.AttackEmotes.,victim.CreatureId, victim.transform.position,0.2f);
+                        if (dcAttack) { victim.Speak("Save!"); } else { victim.SpeakEx("Miss!"); }
+                       
+                       
                         //XJ:(2022/10/13)  (2022/10/18)  add (secureSuccess miss)
                         if (secureSuccess == true)
                         {
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim)+ "]<size=28>Evades attack<size=4>\r\n";
                             gm = players;
+                            owner = players;
+                            chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value);
                         }
                         else if (dcAttack)
                         {
-                            gm = players + "<size=16>" + lastResult["Total"] + " vs DC" + lastRollRequest.roll.Split('/')[0];
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=28>Successfull saving throw<size=4>\r\n";
+                            gm = players + "<size=16>" + lastResult["Total"] + " vs DC " + lastRollRequest.roll.Split('/')[0];
+                            owner = gm;
+                            chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, LocalClient.Id.Value);
                         }
                         else
                         {
-                            gm = players + "<size=16>" + lastResult["Total"] + " vs AC" + characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].ac; 
-                        }                        
-                        //XJ: (2022/10/17) add 
-                        if (characters.ContainsKey(RuleSet5EPlugin.Utility.GetCharacterName(victim)))
-                        { 
-                            if (characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].NPC == false)
-                            {
-                                players = gm;
-                                owner = gm;
-                            }
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=28>Evades attack<size=4>\r\n";
+                            gm = players + "<size=16>" + lastResult["Total"] + " vs AC " + (int.Parse(characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].ac) + (victim_amountACBonusDie != "" ? int.Parse(victim_amountACBonusDie) : 0));
+                            owner = gm;                            
+                            chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value);
                         }
-                        //XJ: show complete info to Player, if victims is Player 
-                        chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value);                        
+                        
+
+                        if (secureSuccess == false & dcAttack == true & multiTargetAssets.Count != 0)
+                        {                     
+                            if (multiTargetAssets.Count != MultitargetAssetsIndex) { stateMachineState = StateMachineState.idle; victim.SetGlow(false,UnityEngine.Color.red); RollCleanup(dm, ref stepDelay); StartSequencePre(multiAttackType, multiRoll, instigator.CreatureId, null, null); }
+                        }
                         break;
                     case StateMachineState.attackAttackHitReport:
                         stateMachineState = StateMachineState.attackDamageDieCreate;
                         //XJ (2022/12/04) add:
-                        // CreatureBoardAsset.AttackEmotes attackEmote = new CreatureBoardAsset.AttackEmotes();
+                        //CreatureBoardAsset.AttackEmotes attackEmote = new CreatureBoardAsset.AttackEmotes();                        
                         if (lastRollRequest.info != "")
                         {
                             instigator.StartTargetEmote(victim, lastRollRequest.info);
@@ -621,88 +678,83 @@ namespace LordAshes
                         {
                             switch (lastRollRequest.type.ToUpper())
                             {
-                                //XJ (2022/10/19): Change:
+                                //XJ (2022/10/19): Change: // XJ (2023/02/22) Uncommented. All characters can see effect
                                 case "MAGIC":
                                     instigator.StartTargetEmote(victim, "TLA_MagicMissileAttack");
                                     break;
-                                case "RANGE":
+                               case "RANGE":
                                 case "RANGED":
-                                    instigator.StartTargetEmote(victim, "TLA_LaserRed");
+                                   instigator.StartTargetEmote(victim, "TLA_LaserRed");
                                     break;
                                 default:
                                     instigator.StartTargetEmote(victim, "TLA_MeleeAttack");
                                     break;
-                                    //case "MAGIC":
-                                    //     attackEmote = CreatureBoardAsset.AttackEmotes.TLA_MagicMissileAttack;
-                                    //    break;
-                                    //case "RANGE":
-                                    //case "RANGED":
-                                    //    attackEmote = CreatureBoardAsset.AttackEmotes.TLA_LaserRed;
-                                    //    break;
-                                    //default:
-                                    //    attackEmote = CreatureBoardAsset.AttackEmotes.Hit;                                        
-                                    //    break;
-                                    //XJ: Change effects system according to new "Attack" function (TALESPIRE UPDATE).
+
+                                //case "MAGIC":
+                                //   // attackEmote = CreatureBoardAsset.AttackEmotes.TLA_MagicMissileAttack;
+                                //    break;
+                                //case "RANGE":
+                                //case "RANGED":
+                                //    //attackEmote = CreatureBoardAsset.AttackEmotes.TLA_LaserRed;
+                                //    break;
+                                //default:
+                                //   // attackEmote = CreatureBoardAsset.AttackEmotes.Hit;
+                                //    break;
+                                    //   XJ: Change effects system according to new "Attack" function(TALESPIRE UPDATE).
                             }
                         }
                         //XJ:(2022/10/17) add two arguments 
-                        instigator.Attack(victim.CreatureId, victim.transform.position);
-                        //XJ: Fix (GROUP SELECT TALESPIRE UPDATE)
-                        //XJ (2022/12/04)  Animation after reaction.
-                        victim.SpeakEx("Hit!");
-                        players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + " Is Hit]<size=4>";
-                        owner = players;
+                        // instigator.Attack(attackEmote, victim.CreatureId, victim.transform.position, 0.2f);
+                        //CreatureManager.AttackCreature(attackEmote, instigator.CreatureId, instigator.transform.position, victim.CreatureId, instigator.transform.position); //XJ:(2022/02/22) all characters can see effect
+                        //XJ (2022/12/04)  Animation after reaction  
+
+                        if (dcAttack) { if (halfDamage) { victim.Speak("Save!"); } else { victim.Speak("Fail!"); } } else { victim.SpeakEx("Hit!"); }
+                                               
+                        
                         //XJ:(2022/10/18)
                         if (secureSuccess)
                         {
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]<size=28>Hits "+ RuleSet5EPlugin.Utility.GetCharacterName(victim)+ "<size=4>\r\n";
                             gm = players + "<size=16>" + "Automatic Success";
+                            owner = gm;
+                            chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, LocalClient.Id.Value);
                         }
                         else if (dcAttack)
-                        {
-                            gm = players + "<size=16>" + lastResult["Total"] + " vs DC" + lastRollRequest.roll.Split('/')[0];
+                        {                            
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=28>Failed saving throw<size=4>\r\n";
+                            if (halfDamage) {players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=28>Successfull saving throw<size=4>\r\n"; }
+                            gm = players + "<size=16>" + lastResult["Total"] + " vs DC " + lastRollRequest.roll.Split('/')[0];
                             //XJ: 2022/10/18
-                            if (halfDamage) { gm = gm + "(On miss half damage)"; }
+                            if (halfDamage) { gm = gm + " (On save: half damage)"; }
                             //XJ: Change info message when miss Dc attack with half damage.
+                            owner = gm;
+                            chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, LocalClient.Id.Value);
                         }
                         else
                         {
-                            gm = players + "<size=16>" + lastResult["Total"] + " vs AC" + characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].ac;
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]<size=28>Hits " + RuleSet5EPlugin.Utility.GetCharacterName(victim)+ "<size=4>\r\n";
+                            gm = players + "<size=16>" + lastResult["Total"] + " vs AC " + (int.Parse(characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].ac) + (victim_amountACBonusDie != "" ? int.Parse(victim_amountACBonusDie) : 0));
+                            owner = gm;
+                            chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value);
                         }
-                        //XJ: Fix Message (dcattack / SecureSuccess) 
-
-                        //XJ (2022/10/17) add
-                        if (characters.ContainsKey(RuleSet5EPlugin.Utility.GetCharacterName(victim)))
-                        {
-                            if (characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].NPC == false)
-                            {
-                                players = gm;
-                                owner = gm;
-                            }
-                        }
-                        //XJ: show complete info to Player, if victims is Player
-                        chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value);
-                        if (useDamageBonusDie)
-                        {
-                            if (diagnostics >= DiagnosticMode.high) { Debug.Log("RuleSet 5E Plugin: Adding Bonus Damage To Damage Sequence"); }
-                            Roll find = lastRollRequest.link;
-                            string damageType = find.type;
-                            while (find.link != null) { find = find.link; damageType = find.type; }
-                            find.link = new Roll()
-                            {
-                                name = "Bonus",
-                                type = damageType,
-                                roll = amountDamageBonusDie,
-                                range = null,
-                                link = null,
-                                info = null
-                            };
-                        }
+                        firstWithDamageBonus = true;
                         tmp = lastRollRequest.link;
                         damages.Clear();
                         //XJ:(2022/10/08) add (2022/10/18) (if (secureSuccess == false) to avoid crash if secureSuccess is true and Lastroll not exist.
                         if (secureSuccess == false) { if ((bool)lastResult["IsMax"] == true) { damageDieMultiplier = float.Parse(lastRollRequest.critmultip); } else { damageDieMultiplier = 1.0f; } }
                         //XJ: Change 2.0f multiplier by critical multiplier attack stat.
-                        stepDelay = 1f;
+                        //XJ: (2022/12/14) Multitarget DC, add to list:
+                        if (secureSuccess == false & dcAttack == true & multiTargetAssets.Count != 0)
+                        {                            
+                            MultiDCAttackData multiDCAttackData = new MultiDCAttackData();
+                            multiDCAttackData.mVcitim = victim;                           
+                            multiDCAttackData.mHalfDamage = halfDamage;
+                            multiDCAttackData.mReactionHalve = reactionHalve;
+                            multiDCAttackDataList.Add(multiDCAttackData);                            
+                            if (multiTargetAssets.Count != MultitargetAssetsIndex) { stateMachineState = StateMachineState.idle; victim.SetGlow(false, UnityEngine.Color.red); RollCleanup(dm, ref stepDelay); StartSequencePre(multiAttackType, multiRoll, instigator.CreatureId, null, null); }
+                        }
+                      
+                        stepDelay = 1f;                        
                         break;
                     case StateMachineState.attackDamageDieCreate:
                         try
@@ -716,13 +768,13 @@ namespace LordAshes
                                     {
                                         if (int.Parse(tmp.roll.Substring(0, tmp.roll.ToUpper().IndexOf("D"))) > 3)
                                         {
-                                            GameObject dolly = GameObject.Find("dolly");
+                                            //GameObject dolly = GameObject.Find("dolly");
                                             if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Adjusting Dolly And Camera For Large Dice Count"); }
                                             dolly.transform.position = new Vector3(-100f, 4f, -3f);
                                         }
                                         else
                                         {
-                                            GameObject dolly = GameObject.Find("dolly");
+                                            //GameObject dolly = GameObject.Find("dolly");
                                             if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Adjusting Dolly And Camera For Small Dice Count"); }
                                             dolly.transform.position = new Vector3(-100f, 2f, -1.5f);
                                         }
@@ -744,8 +796,10 @@ namespace LordAshes
                                         tmp.roll = (int.Parse(tmp.roll.Substring(sPos, Pos - sPos)) * damageDieMultiplier).ToString() + tmp.roll.Substring(Pos, tmp.roll.Length - Pos);
                                     }
                                 }
-                                //XJ: double damage dies on critical hit.
-                                RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(tmp.name) + ":" + tmp.roll, ref stepDelay);
+                                //XJ: double damage dies on critical hit.                                
+                                if (useDamageBonusDie & firstWithDamageBonus & tmp.roll != "0"){  RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(tmp.name) + ":" + tmp.roll + ("+-".Contains(amountDamageBonusDie.Substring(0,1)) ? amountDamageBonusDie : "+" + amountDamageBonusDie), ref stepDelay); firstWithDamageBonus= false; }
+                                else { RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(tmp.name) + ":" + tmp.roll, ref stepDelay); }
+                                
                             }
                             else
                             {
@@ -756,7 +810,6 @@ namespace LordAshes
                         {
                             stateMachineState = StateMachineState.attackRollCleanup;
                             Debug.LogWarning("RuleSet 5E Plugin:!Critical error:[ " + e.Message + " ]!");
-
                         }
                         break;
                     case StateMachineState.attackDamageDieWaitCreate:
@@ -772,47 +825,56 @@ namespace LordAshes
                         // Callback propagates to next phase
                         break;
                     case StateMachineState.attackDamageDieRollReport:
-                        dm.ClearAllDice(lastRollId);
+                        RollId.TryParse(lastRollId.ToString(), out  idLastroll);
+                        dm.ClearDiceRoll(idLastroll);
                         stateMachineState = StateMachineState.attackDamageDieCreate;
                         //XJ (2022/10/08) add
-                        if(loadedRollRequest == null)
-                        {
-                            int Pos = tmp.roll.ToUpper().IndexOf("D");
-                            int sPos = Pos;
-                            while ("0123456789".Contains(tmp.roll.Substring(sPos - 1, 1))) { sPos--; if (sPos == 0) { break; } }                           
-                            if (sPos > 1) 
-                            {                               
-                                if ("+".Contains(tmp.roll.Substring(sPos - 1, 1)))                                
-                                {                                    
-                                    lastResult["Total"] = int.Parse(lastResult["Total"].ToString()) + int.Parse(tmp.roll.Substring(0, sPos - 1));
-                                }
-                                else
-                                {                                   
-                                    lastResult["Total"] = int.Parse(lastResult["Total"].ToString()) - int.Parse(tmp.roll.Substring(0, sPos - 1));
-                                }
-                                lastResult["Expanded"] = tmp.roll.Substring(0, sPos) + lastResult["Expanded"];
-                            }                           
-                        }
-                        //XJ:add modifier previous of damage rolls.
+                        //if (loadedRollRequest == null)
+                        //{
+                        //    int Pos = tmp.roll.ToUpper().IndexOf("D");
+                        //    int sPos = Pos;                           
+                        //    if (sPos > 1)
+                        //    {
+                        //        while ("0123456789".Contains(tmp.roll.Substring(sPos - 1, 1))) { sPos--; if (sPos == 0) { break; } }
+                        //        if ("+".Contains(tmp.roll.Substring(sPos - 1, 1)))
+                        //        {
+                        //            lastResult["Total"] = int.Parse(lastResult["Total"].ToString()) + int.Parse(tmp.roll.Substring(0, sPos - 1));
+                        //        }
+                        //        else
+                        //        {
+                        //            lastResult["Total"] = int.Parse(lastResult["Total"].ToString()) - int.Parse(tmp.roll.Substring(0, sPos - 1));
+                        //        }
+                        //        lastResult["Expanded"] = tmp.roll.Substring(0, sPos) + lastResult["Expanded"];
+                        //    }
+                        //}
+                        ////XJ:add modifier previous of damage rolls.
+                        if ((int)lastResult["Total"] < 0) { lastResult["Total"] = 0; }
                         if (int.Parse(lastResult["Total"].ToString()) == 0)
                         {
                             instigator.SpeakEx(lastRollRequest.name + ":\r\n" + "No damage");
-                            damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastRollRequest.roll, lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                            damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastResult["Roll"].ToString(), lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
                         }
                         else
-                        {
+                        {                            
                             if (lastRollRequest.roll != "")
                             {
                                 instigator.SpeakEx(lastRollRequest.name + ":\r\n" + lastResult["Total"] + " " + lastRollRequest.type);
-                                damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastRollRequest.roll, lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                                if (useDamageBonusDie & damages.Count==0)
+                                {
+                                    //damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastRollRequest.roll + ("+-".Contains(amountDamageBonusDie.Substring(0,1))? amountDamageBonusDie:"+"+ amountDamageBonusDie), lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                                    damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastResult["Roll"].ToString(), lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                                } 
+                                else
+                                {
+                                    damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastResult["Roll"].ToString(), lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                                }
                             }
                             else
                             {
                                 instigator.SpeakEx(lastRollRequest.name + ":\r\n" + lastRollRequest.type);
-                                damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastRollRequest.roll, lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                                damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastResult["Roll"].ToString(), lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
                             }
                         }
-
                         stepDelay = 1.0f;
                         tmp = tmp.link;
                         break;
@@ -822,12 +884,11 @@ namespace LordAshes
                         info = "";
                         foreach (Damage dmg in damages)
                         {
-                            //XJ: 2022/10/18
-                            if (halfDamage) { dmg.total = dmg.total / 2; dmg.expansion = dmg.expansion + " (Miss: Half Damage)"; }
-                            //XJ: half damage in DC attacks on successful save.
-                            total = total + dmg.total;  
+    
+                            total = total + dmg.total;
                             //XJ(2022/10/17)
-                            info = info + dmg.total + " " + dmg.type + " (" + dmg.name + ") " + dmg.roll + " = " + dmg.expansion.Replace("+-", "-") + "\r\n";
+                            // info = info + dmg.total + " " + dmg.type + " (" + dmg.name + ") " + dmg.roll + " = " + dmg.expansion.Replace("+-", "-") + "\r\n";
+                            if (dmg.roll != "0") {info = info + dmg.total + " " + dmg.type + " (" + dmg.name + ") " + dmg.roll + " = " + dmg.expansion + "\r\n";}
                             //XJ: Add .Replace("+-", "-")  to show "-" on chat instead "+-".
 
                         }
@@ -835,8 +896,8 @@ namespace LordAshes
                         if (total == 0)
                         {
                             //info = lastRollRequest.roll.states.conditions  //XJ:to add states in the future
-                            info = "";
-                            players = "[" + Utility.GetCharacterName(instigator) + "]<size=32> No damage <size=16>";                            
+                            //if (lastRollRequest.roll == "0") { info = ""; }
+                            players = "[" + Utility.GetCharacterName(instigator) + "]<size=28>Attack without damage <size=16>";
                             owner = players + "\r\n" + info;
                             gm = owner;
                             chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, LocalClient.Id.Value);
@@ -849,7 +910,7 @@ namespace LordAshes
                                 yield return new WaitForSeconds(0.5f * processSpeed);
                                 instigator.SpeakEx("Total Damage: " + total);
                             }
-                            players = "[" + Utility.GetCharacterName(instigator) + "]<size=32>Damage " + total + "<size=16>";//XJ(2022/10/26) It only takes into account the last die.  + (((bool)lastResult["IsMax"] == true) ? " (Critical Hit)" : "");
+                            players = "[" + Utility.GetCharacterName(instigator) + "]<size=28>Attack damage: " + total + "<size=16>";//XJ(2022/10/26) It only takes into account the last die.  + (((bool)lastResult["IsMax"] == true) ? " (Critical Hit)" : "");
                             owner = players + "\r\n" + info;
                             gm = owner;
                             chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, LocalClient.Id.Value);
@@ -857,123 +918,145 @@ namespace LordAshes
                         break;
                     case StateMachineState.attackDamageDieDamageTake:
                         stateMachineState = StateMachineState.attackRollCleanup;
-                        bool fullDamage = true;
-                        int adjustedDamage = 0;
-                        string damageList = "";
-                        //XJ:(2022/10/11)
-                        foreach (Damage dmg in damages)
-                        {
-                            //XJ:(2022/10/08) add:
-                            if (reactionHalve == true) { dmg.total = (int)(dmg.total / 2); fullDamage = false; }
-                            //XJ:To implement Halve damage
-                            if (characters.ContainsKey(RuleSet5EPlugin.Utility.GetCharacterName(victim)))
-                            {
-                                foreach (string immunity in characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].immunity)
-                                {
-                                    if (dmg.type == immunity) { dmg.total = 0; dmg.type = dmg.type + ":Immunity"; fullDamage = false; }
-                                }
-                                foreach (string resisitance in characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].resistance)
-                                {
-                                    if (dmg.type == resisitance) { dmg.total = (int)(dmg.total / 2); dmg.type = dmg.type + ":Resistance"; fullDamage = false; }
-                                }
-                                //XJ:(2022/10/09) add                                
-                                foreach (string vulnerability in characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].vulnerability)
-                                {
-                                    if (dmg.type == vulnerability) { dmg.total = (int)(dmg.total * 2); dmg.type = dmg.type + ":Vulnerability"; fullDamage = true; }
-                                }
-                                //XJ: (2022/10/09) allow vulnerability
-                            }
-                            adjustedDamage = adjustedDamage + dmg.total;
-                            if (reactionHalve) { dmg.type = dmg.type + " [Halve]"; }
-                            damageList = damageList + dmg.total + " " + dmg.type + " (" + dmg.name + ") " + dmg.roll + " = " + dmg.expansion + "\r\n";                           
+                        //XJ: (2022/12/14) Multitarget DC Code.
+                        if (secureSuccess == true || dcAttack == false || multiTargetAssets.Count == 0)
+                        {                   
+                            MultiDCAttackData multiDCAttackData = new MultiDCAttackData();
+                            multiDCAttackData.mVcitim = victim;
+                            multiDCAttackData.mHalfDamage = halfDamage;
+                            multiDCAttackData.mReactionHalve = reactionHalve;
+                            multiDCAttackDataList.Add(multiDCAttackData);                             
                         }                       
-                        //XJ change each{} / if {} order. To allow take damage on victim if dnd5e file is not load.
-                        //XJ:(2022/10/08)
-                        reactionHalve = false;                       
-                        hp = Math.Max((int)(victim.Hp.Value - adjustedDamage), 0);
-                        hpMax = (int)victim.Hp.Max;                       
-                        CreatureManager.SetCreatureStatByIndex(victim.CreatureId, new CreatureStat(hp, hpMax), -1);                        
-                        damageList = "<size=32>Damage: " + adjustedDamage + "<size=16>\r\n" + damageList;                        
-                        if (adjustedDamage == 0)
-                        {
-                            victim.SpeakEx("Your attempts are futile!");
-                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + " takes no damage]<size=4>\r\n";
-                            owner = players;
-                            gm = players + "<size=16>" + damageList;
-                        }                        
-                        else if (!fullDamage)
-                        {
-                            if (hp > 0)
+                        
+                        foreach (MultiDCAttackData tempmultiDcattackData in multiDCAttackDataList)
+                        {                            
+                            victim = tempmultiDcattackData.mVcitim;
+                            halfDamage = tempmultiDcattackData.mHalfDamage;
+                            reactionHalve = tempmultiDcattackData.mReactionHalve;
+                            
+                            bool fullDamage = true;
+                            int adjustedDamage = 0;
+                            string damageList = "";
+                            string damageListVictim = "";
+
+                            foreach (Damage dmg in damages)
                             {
-                                victim.SpeakEx("I resist your efforts!");
-                            }
-                            else
-                            {
-                                victim.SpeakEx("I resist your efforts\r\nbut I am slain!");
-                                if (deadAnimation.ToUpper() != "REMOVE")
+                                int tempTotal = dmg.total;
+                                string tempExpansion = dmg.expansion;
+
+                                if (halfDamage) { tempTotal = tempTotal / 2; tempExpansion = tempExpansion + " (Miss: Half Damage)"; }
+                                //XJ:(2022/10/08) add:
+                                if (reactionHalve == true) { tempTotal = (int)(tempTotal / 2); fullDamage = false; }
+                                //XJ:To implement Halve damage
+                                if (characters.ContainsKey(RuleSet5EPlugin.Utility.GetCharacterName(victim)))
                                 {
-                                    if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Playing Death Animation '" + deadAnimation + "'"); }
-                                    victim.StartTargetEmote(instigator, deadAnimation);
+                                    foreach (string immunity in characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].immunity)
+                                    {
+                                        if (dmg.type == immunity) { tempTotal = 0; dmg.type = dmg.type + ":Immunity"; fullDamage = false; }
+                                    }
+                                    foreach (string resisitance in characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].resistance)
+                                    {
+                                        if (dmg.type == resisitance) { tempTotal = (int)(tempTotal / 2); dmg.type = dmg.type + ":Resistance"; fullDamage = false; }
+                                    }
+                                    //XJ:(2022/10/09) add                                
+                                    foreach (string vulnerability in characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].vulnerability)
+                                    {
+                                        if (dmg.type == vulnerability) { tempTotal = (int)(tempTotal * 2); dmg.type = dmg.type + ":Vulnerability"; fullDamage = true; }
+                                    }
+                                    //XJ: (2022/10/09) allow vulnerability
+                                }
+                                adjustedDamage = adjustedDamage + tempTotal;
+                                if (reactionHalve) { dmg.type = dmg.type + " [Halve]"; }
+                                damageList = damageList + tempTotal + " " + dmg.type + " (" + dmg.name + ") " + dmg.roll + " = " + tempExpansion + "\r\n";
+                                damageListVictim = damageListVictim + tempTotal + " " + dmg.type + " (" + dmg.name + ") " + "\r\n";
+                            }
+                            //XJ change each{} / if {} order. To allow take damage on victim if dnd5e file is not load.
+                            //XJ:(2022/10/08)
+                            reactionHalve = false;
+                            hp = Math.Max((int)(victim.Hp.Value - adjustedDamage), 0);
+                            hpMax = (int)victim.Hp.Max;
+                            CreatureManager.SetCreatureStatByIndex(victim.CreatureId, new CreatureStat(hp, hpMax), -1);
+                            damageList = "<size=24>Damage: " + adjustedDamage + "<size=16>\r\n" + damageList;
+                            if (adjustedDamage == 0 & fullDamage == true)
+                            {
+                                victim.SpeakEx("Your attempts are futile!");
+                                damageList = "<size=16>\r\n" + damageList;
+                                players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=28>Takes no damage<size=4>\r\n";
+                                owner = players + "<size=16>";
+                                gm = players + "<size=16>";
+                            }
+                            else if (!fullDamage)
+                            {
+                                if (hp > 0)
+                                {
+                                    victim.SpeakEx("I resist your efforts!");
                                 }
                                 else
                                 {
-                                    yield return new WaitForSeconds(1f);
-                                    if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Requesting Mini Remove"); }
-                                    victim.RequestDelete();
+                                    victim.SpeakEx("I resist your efforts\r\nbut I am slain!");
+                                    if (deadAnimation.ToUpper() != "REMOVE")
+                                    {
+                                        if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Playing Death Animation '" + deadAnimation + "'"); }
+                                        victim.StartTargetEmote(instigator, deadAnimation);
+                                    }
+                                    else
+                                    {
+                                        yield return new WaitForSeconds(1f);
+                                        if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Requesting Mini Remove"); }
+                                        victim.RequestDelete();
+                                    }
                                 }
-                            }
-                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + " takes some damage]<size=4>\r\n";
-                            owner = players;
-                            gm = players + "<size=16>" + damageList;
-                        }                        
-                        else
-                        {
-                            if (hp > 0)
-                            {
-                                victim.SpeakEx("Ouch!");
-                            }
-                            else
-                            {
-                                victim.SpeakEx("I am slain!");
-                                if (deadAnimation.ToUpper() != "REMOVE")
+                                if (adjustedDamage == 0)
                                 {
-                                    if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Playing Death Animation '" + deadAnimation + "'"); }
-                                    victim.StartTargetEmote(instigator, deadAnimation);
+                                    players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=28>Takes no damage<size=4>\r\n";
                                 }
                                 else
                                 {
-                                    yield return new WaitForSeconds(1f);
-                                    if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Requesting Mini Remove"); }
-                                    victim.RequestDelete();
+                                    players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=28>Takes some damage<size=4>\r\n";
                                 }
+                                owner = players + "<size=16>" + damageListVictim;
+                                gm = players + "<size=16>" + damageList;
                             }
-                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + " takes the damage]<size=4>\r\n";
-                            owner = players;
-                            gm = players + "<size=16>" + damageList;
-                        }                        
-                        gm = gm + "\r\nRemaining HP: " + hp + " of " + hpMax;
-                        //XJ (2022/10/17) add
-                        if (characters.ContainsKey(RuleSet5EPlugin.Utility.GetCharacterName(victim)))
-                        {
-                            if (characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].NPC == false)
+                            else
                             {
-                                players = gm;
-                                owner = gm;
+                                if (hp > 0)
+                                {
+                                    victim.SpeakEx("Ouch!");
+                                }
+                                else
+                                {
+                                    victim.SpeakEx("I am slain!");
+                                    if (deadAnimation.ToUpper() != "REMOVE")
+                                    {
+                                        if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Playing Death Animation '" + deadAnimation + "'"); }
+                                        victim.StartTargetEmote(instigator, deadAnimation);
+                                    }
+                                    else
+                                    {
+                                        yield return new WaitForSeconds(1f);
+                                        if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Requesting Mini Remove"); }
+                                        victim.RequestDelete();
+                                    }
+                                }                                
+                                players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(victim) + "]<size=28>Takes the damage<size=4>\r\n";
+                                owner = players + "<size=16>" + damageListVictim;
+                                gm = players + "<size=16>" + damageList;
                             }
+                            gm = gm + "\r\nRemaining HP: " + hp + " of " + hpMax;
+                            owner = owner + "\r\nRemaining HP: " + hp + " of " + hpMax;
+
+                            CreatureManager.SetCreatureStatByIndex(victim.CreatureId, new CreatureStat(hp, hpMax), -1);
+                            chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value);
+                            if (halfDamage) { halfDamage= false; }  
                         }
-                        //XJ: show complete info to Player, if victims is Player
-                        CreatureManager.SetCreatureStatByIndex(victim.CreatureId, new CreatureStat(hp, hpMax), -1);
-                        chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value);
-                        //XJ:(2022/10/9) add
-                        //if (changeBaseColors & characters.ContainsKey(RuleSet5EPlugin.Utility.GetCharacterName(victim)))
-                        //{
-                        //    CustomBColor(victim,hp,hpMax);
-                        //}
-                        //XJ:change base color based on life.  
+
                         break;
                     case StateMachineState.attackRollCleanup:
                         stateMachineState = StateMachineState.idle;
                         RollCleanup(dm, ref stepDelay);
+                        multiDCAttackDataList.Clear();
+                        if (victim != null) { victim.SetGlow(false, UnityEngine.Color.red); }
+                        if (multiTargetAssets.Count != 0) { StartSequencePre(multiAttackType, multiRoll, instigator.CreatureId, null, null); };
                         break;
                     // ******************
                     // * Skill Sequence *
@@ -981,7 +1064,7 @@ namespace LordAshes
                     case StateMachineState.skillRollSetup:
                         stateMachineState = StateMachineState.skillRollDieCreate;
                         RollSetup(dm, ref stepDelay);
-                        if (rollingSystem == RollMode.automaticDice) { GameObject.Find("dolly").transform.position = new Vector3(-100f, 2f, -1.5f); }
+                        if (rollingSystem == RollMode.automaticDice) { dolly.transform.position = new Vector3(-100f, 2f, -1.5f); }
                         damageDieMultiplier = 1.0f;
                         break;
                     case StateMachineState.skillRollDieCreate:
@@ -1001,16 +1084,14 @@ namespace LordAshes
                         break;
                     case StateMachineState.skillBonusRollDieCreate:
                         stateMachineState = StateMachineState.skillRollDieRollReport;
-                        //XJ: (2022/10/18)
-                        lastResult["Expanded"] = lastResult["Expanded"].ToString().Replace("+-","-");
-                        lastResult["Roll"] = lastResult["Roll"].ToString().Replace("+-", "-");
-                        //XJ: To fix  +- to -
+
                         if (useSkillBonusDie & amountSkillBonusDie != "")
                         {
                             stateMachineState = StateMachineState.skillBonusRollDieWaitCreate;
                             hold = lastResult;
                             //XJ: (2022/10/07) Added new codeline: 
-                            dm.ClearAllDice(lastRollId);
+                            RollId.TryParse(lastRollId.ToString(), out  idLastroll);
+                            dm.ClearDiceRoll(idLastroll);
                             //XJ: To clear previus rolls.
                             RollCreate(dt, $"talespire://dice/" + SafeForProtocolName("Bonus Die") + ":" + amountSkillBonusDie, ref stepDelay);
                             if (rollingSystem.ToString().ToUpper().Contains("MANUAL")) { StartCoroutine(DisplayMessage("Please Roll Provided Die Or Dice To Continue...", 3f)); }
@@ -1028,36 +1109,36 @@ namespace LordAshes
                         break;
                     case StateMachineState.skillRollDieRollReport:
                         stateMachineState = StateMachineState.skillRollCleanup;
-                        dm.ClearAllDice(lastRollId);
+                        RollId.TryParse(lastRollId.ToString(), out RollId idLastroll3);
+                        dm.ClearDiceRoll(idLastroll3);
                         if (useSkillBonusDie & amountSkillBonusDie != "")
                         {
-                            //XJ: (2022/10/07)
-                            //hold["Total"] = ((int)hold["Total"] + (int)lastResult["Total"]);                            
-                            //hold["Expanded"] = hold["Expanded"] + (("+-".Contains(lastResult["Expanded"].ToString().Substring(0, 1))) ? lastResult["Expanded"].ToString() : "+" + lastResult["Expanded"].ToString());
-                            //changed by                          
-                            if (amountSkillBonusDie.ToUpper().Contains("D") & "-".Contains(amountSkillBonusDie.Substring(0, 1)) & loadedRollRequest == null)
+
+                            hold["Total"] = ((int)hold["Total"] + (int)lastResult["Total"]);                           
+                            if ( "-".Contains(lastResult["Expanded"].ToString().Substring(0, 1)))// & loadedRollRequest == null)
                             {
-                                hold["Total"] = ((int)hold["Total"] - (int)lastResult["Total"]);
-                                hold["Expanded"] = hold["Expanded"] + "-" + lastResult["Expanded"].ToString().Replace("-", "+").Replace("++", "-");
+                                //hold["Expanded"] = hold["Expanded"] + "-" + lastResult["Expanded"].ToString();
+                                hold["Expanded"] = hold["Expanded"] + lastResult["Expanded"].ToString();
                             }
                             else
                             {
-                                hold["Total"] = ((int)hold["Total"] + (int)lastResult["Total"]);
-                                hold["Expanded"] = hold["Expanded"] + (("+-".Contains(lastResult["Expanded"].ToString().Substring(0, 1))) ? lastResult["Expanded"].ToString().Replace("+-", "-") : "+" + lastResult["Expanded"].ToString().Replace("+-", "-"));
+                                hold["Expanded"] = hold["Expanded"] + "+" + lastResult["Expanded"].ToString();
                             }
+                            // hold["Expanded"] = hold["Expanded"] + (("+-".Contains(lastResult["Expanded"].ToString().Substring(0, 1))) ? lastResult["Expanded"].ToString().Replace("+-", "-") : "+" + lastResult["Expanded"].ToString().Replace("+-", "-"));
+                            //}
 
                             //XJ: To allow negative roll bonus dice skill and solve chat visual problems with expanded string in this case (2022/10/07): when rolltype not is automaticGenerator.
-                                                        
-                            hold["Roll"] = hold["Roll"] + (("+-".Contains(amountSkillBonusDie.Substring(0, 1))) ? amountSkillBonusDie : "+" + amountSkillBonusDie);                            
+
+                            hold["Roll"] = hold["Roll"] + (("+-".Contains(lastResult["Roll"].ToString().Substring(0, 1))) ? lastResult["Roll"].ToString() : "+" + lastResult["Roll"].ToString());                            
                             lastResult = hold;
                         }
                         if (lastRollRequest.roll != "")
                         {
-                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]<size=32>" + lastRollRequest.name + " " + lastResult["Total"] + "\r\n";
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]<size=28>" + lastRollRequest.name + ": " + lastResult["Total"] + "\r\n";
                         }
                         else
                         {
-                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]<size=32>" + lastRollRequest.name + "\r\n";
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]<size=28>" + lastRollRequest.name + "\r\n";
                         }
                         owner = players;
                         owner = owner + "<size=16>" + lastResult["Roll"] + " = ";
@@ -1081,7 +1162,7 @@ namespace LordAshes
                         else if (lastRollRequest.type.ToUpper().Contains("PRIVATE"))
                         {
                             instigator.SpeakEx(lastRollRequest.name);
-                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]<size=32>" + lastRollRequest.name + "\r\n";
+                            players = "[" + RuleSet5EPlugin.Utility.GetCharacterName(instigator) + "]<size=28>" + lastRollRequest.name + "\r\n";
                         }
                         else // if (lastRollRequest.type.ToUpper().Contains("PUBLIC"))
                         {
@@ -1091,8 +1172,8 @@ namespace LordAshes
                         {
                             players = null;
                             owner = null;
-                        }
-                        chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, new Bounce.Unmanaged.NGuid(LocalClient.Id.ToString()));
+                        }                        
+                        chatManager.SendChatMessageEx(players, owner, gm, instigator.CreatureId, LocalClient.Id.Value);
                         stepDelay = 1.0f;
                         break;
                     case StateMachineState.skillRollCleanup:
@@ -1101,6 +1182,7 @@ namespace LordAshes
                         break;
                     case StateMachineState.skillRollMore:
                         stateMachineState = StateMachineState.idle;
+                        victim.SetGlow(false,UnityEngine.Color.green);
                         if (lastRollRequest.link != null)
                         {
                             lastRollRequest = lastRollRequest.link;
@@ -1112,9 +1194,10 @@ namespace LordAshes
                     // ********************
                     case StateMachineState.healingRollStart:
                         RollSetup(dm, ref stepDelay);
-                        if (rollingSystem == RollMode.automaticDice) { GameObject.Find("dolly").transform.position = new Vector3(-100f, 2f, -1.5f); }
+                        if (rollingSystem == RollMode.automaticDice) { dolly.transform.position = new Vector3(-100f, 2f, -1.5f); }
                         damageDieMultiplier = 1.0f;
                         tmp = lastRollRequest;
+                        firstWithDamageBonus = true;
                         damages.Clear();
                         stepDelay = 1f;
                         stateMachineState = StateMachineState.healingRollDieCreate;
@@ -1129,20 +1212,21 @@ namespace LordAshes
                                 {
                                     if (int.Parse(tmp.roll.Substring(0, tmp.roll.ToUpper().IndexOf("D"))) > 3)
                                     {
-                                        GameObject dolly = GameObject.Find("dolly");
+                                        //GameObject dolly = GameObject.Find("dolly");
                                         if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Adjusting Dolly And Camera For Large Dice Count"); }
                                         dolly.transform.position = new Vector3(-100f, 4f, -3f);
                                     }
                                     else
                                     {
-                                        GameObject dolly = GameObject.Find("dolly");
+                                        //GameObject dolly = GameObject.Find("dolly");
                                         if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Adjusting Dolly And Camera For Small Dice Count"); }
                                         dolly.transform.position = new Vector3(-100f, 2f, -1.5f);
                                     }
                                 }
                             }
                             stateMachineState = StateMachineState.healingRollDieWaitCreate;
-                            RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(tmp.name) + ":" + tmp.roll, ref stepDelay);
+                            if (useDamageBonusDie & firstWithDamageBonus) { if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: First Heal Link"); }; RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(tmp.name) + ":" + tmp.roll + ("+-".Contains(amountDamageBonusDie.Substring(0, 1)) ? amountDamageBonusDie : "+" + amountDamageBonusDie), ref stepDelay); firstWithDamageBonus = false; }
+                            else { RollCreate(dt, $"talespire://dice/" + SafeForProtocolName(tmp.name) + ":" + tmp.roll, ref stepDelay); }
                         }
                         else
                         {
@@ -1162,17 +1246,29 @@ namespace LordAshes
                         // Callback propagates to next phase
                         break;
                     case StateMachineState.healingRollDieRollReport:
-                        dm.ClearAllDice(lastRollId);
+                        RollId.TryParse(lastRollId.ToString(), out  idLastroll);
+                        dm.ClearDiceRoll(idLastroll);
+
+
+
+
                         stateMachineState = StateMachineState.healingRollDieCreate;
                         if (lastRollRequest.roll != "")
                         {
                             instigator.SpeakEx(lastRollRequest.name + ":\r\n" + lastResult["Total"]);
-                            damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastRollRequest.roll, lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                            if (useDamageBonusDie & damages.Count == 0)
+                            {
+                                damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastRollRequest.roll + ("+-".Contains(amountDamageBonusDie.Substring(0, 1)) ? amountDamageBonusDie : "+" + amountDamageBonusDie), lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                            }
+                            else
+                            {
+                                damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastResult["Roll"].ToString(), lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                            }                           
                         }
                         else
                         {
                             instigator.SpeakEx(lastRollRequest.name + ":\r\n" + lastRollRequest.type);
-                            damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastRollRequest.roll, lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
+                            damages.Add(new Damage(lastRollRequest.name, lastRollRequest.type, lastResult["Roll"].ToString(), lastResult["Expanded"].ToString(), (int)lastResult["Total"]));
                         }
                         stepDelay = 1.0f;
                         tmp = tmp.link;
@@ -1187,7 +1283,7 @@ namespace LordAshes
                             info = info + dmg.total + " " + dmg.type + " (" + dmg.name + ") " + dmg.roll + " = " + dmg.expansion + "\r\n";
                         }
                         //XJ:(2022/10/17) change:
-                        players = "[" + Utility.GetCharacterName(instigator) + " heal "+ Utility.GetCharacterName(victim) + "]<size=32>Healing " + total + "<size=16>";
+                        players = "[" + Utility.GetCharacterName(instigator) + "]<size=28>Heal " + Utility.GetCharacterName(victim) + " " + total + " hp<size=16>";
                         //XJ: show instigator  and victim names.
                         owner = players + "\r\n" + info;
                         gm = owner;
@@ -1209,35 +1305,23 @@ namespace LordAshes
                         hp = Math.Min((int)(victim.Hp.Value + adjustedHealing), (int)victim.Hp.Max);
                         hpMax = (int)victim.Hp.Max;
                         CreatureManager.SetCreatureStatByIndex(victim.CreatureId, new CreatureStat(hp, hpMax), -1);
-                        healingList = "<size=32>Healing: " + adjustedHealing + "<size=16>\r\n" + healingList;
+                        healingList = "<size=28>Healing: " + adjustedHealing + "<size=16>\r\n" + healingList;
                         //XJ:2022/10/17
-                        players = "[" + Utility.GetCharacterName(victim) + " health]<size=32>Healing " + adjustedHealing + "<size=16>";
-                        owner = players;
+                        players = "[" + Utility.GetCharacterName(victim) + "]<size=28>Regain " + adjustedHealing + " hp<size=16>";
+                        owner = players + "\r\nCurrent HP: " + hp + " of " + hpMax; ;
                         gm = players;
                         //XJ: To avoid show the player name in chat for players and owner.  
                         gm = gm + "\r\nCurrent HP: " + hp + " of " + hpMax;
-                        //XJ (2022/10/17) add
-                        if (characters.ContainsKey(RuleSet5EPlugin.Utility.GetCharacterName(victim)))
-                        {                            
-                            if (characters[RuleSet5EPlugin.Utility.GetCharacterName(victim)].NPC == false)
-                            {                                
-                                players = gm;
-                                owner = gm;
-                            }
-                        }
-                        //XJ: show complete info to Player, if victims is Player
-                        //XJ 2022/10/17 DUPLICATE CODE? CreatureManager.SetCreatureStatByIndex(victim.CreatureId, new CreatureStat(hp, hpMax), -1);
-                        chatManager.SendChatMessageEx(players, owner, gm, victim.CreatureId, LocalClient.Id.Value);
-                        //XJ:(2022/10/9) add
-                        //if (changeBaseColors & characters.ContainsKey(RuleSet5EPlugin.Utility.GetCharacterName(victim)))
-                        //{
-                        //    CustomBColor(victim,hp,hpMax);
-                        //}
-                        //XJ:change base color based on life. 
+
+                      
+                        chatManager.SendChatMessageEx(null, owner, gm, victim.CreatureId, LocalClient.Id.Value);
+          
                         break;
                     case StateMachineState.healingRollCleanup:
                         stateMachineState = StateMachineState.idle;
+                        victim.SetGlow(false, UnityEngine.Color.green);
                         RollCleanup(dm, ref stepDelay);
+                        if (multiTargetAssets.Count != 0) { StartSequencePre(multiAttackType, multiRoll, instigator.CreatureId, null, null); };
                         break;
                 }
                 yield return new WaitForSeconds(stepDelay * processSpeed);
@@ -1294,17 +1378,18 @@ namespace LordAshes
                 case RollMode.manual_side:
                     Utility.DisableProcessing(true);
                     saveCamera = new Existence(Camera.main.transform.position, Camera.main.transform.rotation.eulerAngles);
-                    // new Existence(new Vector3(-100, 12, -12), new Vector3(45, 0, 0)).Apply(Camera.main.transform);
-                    diceSideExistance.Apply(Camera.main.transform);
+                    // new Existance(new Vector3(-100, 12, -12), new Vector3(45, 0, 0)).Apply(Camera.main.transform);
+                    //diceSideExistance.Apply(Camera.main.transform);
                     break;
                 case RollMode.automaticDice:
                     if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Creating Dolly And Camera"); }
-                    GameObject dolly = new GameObject();
+                    dolly = new GameObject();
                     dolly.name = "dolly";
-                    Camera camera = dolly.AddComponent<Camera>();
-                    camera.rect = new Rect(0.005f, 0.20f, 0.20f, 0.25f);
+                    camera = dolly.AddComponent<Camera>();
+                   // camera.rect = new Rect(0.005f, 0.20f, 0.20f, 0.25f);
                     dolly.transform.position = diceSideExistance.position; // new Vector3(-100f, 2f, -1.5f);
                     camera.transform.rotation = Quaternion.Euler(diceSideExistance.rotation); // Quaternion.Euler(new Vector3(55, 0, 0));
+                    camera.targetTexture = auxCameraTexture;
                     stepDelay = 0.1f;
                     break;
                 case RollMode.automaticGenerator:
@@ -1313,13 +1398,49 @@ namespace LordAshes
             }
         }
 
-        public void RollCreate(UIDiceTray dt, string formula, ref float stepDelay)
+        public void RollCreate(UIDiceTray dt, string old_formula, ref float stepDelay)
         {
-            if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("formula before " + formula); }
+            if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("formula before " + old_formula); }
             //formula = formula.Replace("talespire://dice/","!"); //XJ(2022/11/30 Adapted to the new dice system without using the relay
-            formula = formula.Replace("talespire://dice/", "talespire://dice/XRuleset5e");
+            old_formula = old_formula.Replace("talespire://dice/", "talespire://dice/XRuleset5e");
+            string formula=old_formula.Substring(0,old_formula.LastIndexOf(":")+1);
+            int totalmodifier= 0;
+            old_formula = old_formula.Replace("+", "|+").Replace("-", "|-");
+            string formulaneg = String.Empty;
+            
+            foreach (string s_value in old_formula.Substring(old_formula.LastIndexOf(":")+1).Replace(" ", "").Split('|'))
+            {
+                if (s_value.ToUpper().Contains("D"))
+                {
+                    //XJ (26/06/2023) talespire update.
+                    if (s_value.Substring(0, 1) == "-") 
+                    {
+                        formulaneg = formulaneg +  s_value;                    
+                    }
+                    else
+                    {
+                        if (rollingSystem != RollMode.automaticGenerator & s_value.ToUpper().Contains("1D20") & ((dcAttack & (victim_totalAdv | victim_totalDis)) | (!dcAttack & (totalAdv | totalDis)))) { formula = formula + s_value.ToUpper().Replace("1D20", "2D20"); }
+                        else { formula = formula + s_value; }
+                    }
+                }
+                else if (s_value !="")
+                {                    
+                    totalmodifier = "-".Contains(s_value.Substring(0, 1)) ? totalmodifier - int.Parse(s_value.Substring(1)) : totalmodifier + int.Parse(s_value.Replace("+",""));                
+                }                               
+            }
+            //XJ 2023/06/27 Solver temporal TS bug roll resolve:  
+            //  formula = formula + (totalmodifier < 0 ? totalmodifier.ToString() : "+" + totalmodifier.ToString()) + formulaneg;
+            
+            if (formula == old_formula.Substring(0, old_formula.LastIndexOf(":") + 1))
+            {
+                formula = formula + formulaneg + (totalmodifier < 0 ? totalmodifier.ToString() : "+" + totalmodifier.ToString());
+            }
+            else 
+            { 
+                formula = formula + (totalmodifier < 0 ? totalmodifier.ToString() : "+" + totalmodifier.ToString()) + formulaneg; 
+            
+            }
             if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("formula after " + formula); }
-
             RollMode mode = rollingSystem;
             if (!formula.ToUpper().Substring(formula.LastIndexOf(":") + 1).Contains("D"))
             {
@@ -1329,13 +1450,19 @@ namespace LordAshes
             switch (mode)
             {
                 case RollMode.manual:
-                    dt.SpawnAt(new Vector3(instigator.transform.position.x + 1.0f, 1, instigator.transform.position.z + 1.0f), Vector3.zero);
+                    dt.SpawnAt(new Vector3(instigator.transform.position.x + 1.0f, instigator.transform.position.y + 2, instigator.transform.position.z + 1.0f), Vector3.zero);
                     LocalConnectionManager.ProcessTaleSpireUrl(formula); //XJ: (To not use the Relay)
                     //System.Diagnostics.Process.Start(formula).WaitForExit();
                     break;
                 case RollMode.manual_side:
                 case RollMode.automaticDice:
-                    dt.SpawnAt(new Vector3(diceSideExistance.position.x, diceSideExistance.position.y + ((rollingSystem == RollMode.automaticDice) ? 5 : 1), diceSideExistance.position.z), Vector3.zero);
+                    Vector3 spawnposition = new Vector3(diceSideExistance.position.x, diceSideExistance.position.y + ((rollingSystem == RollMode.automaticDice) ? 5 : 1), diceSideExistance.position.z);
+                    dt.SpawnAt(spawnposition, Vector3.zero);
+                    if (rollingSystem == RollMode.manual_side)
+                    {
+                        CameraController.MoveToPosition(spawnposition, false);
+                        CameraController.LookAtTarget(spawnposition);
+                    }
                     LocalConnectionManager.ProcessTaleSpireUrl(formula); //XJ: (To not use the Relay)
                     // System.Diagnostics.Process.Start(formula).WaitForExit(); 
                     break;
@@ -1343,8 +1470,8 @@ namespace LordAshes
                     formula = formula.Substring("talespire://dice/XRuleset5e".Length);
                     loadedRollRequest = new Roll()
                     {
-                        name = formula.Substring(0, formula.IndexOf(":")),
-                        roll = formula.Substring(formula.IndexOf(":") + 1)
+                        name = formula.Substring(0, formula.LastIndexOf(":")),
+                        roll = formula.Substring(formula.LastIndexOf(":") + 1)
                     };
                     NewDiceSet(-2);
                     break;
@@ -1367,8 +1494,11 @@ namespace LordAshes
                     // Do Nothing - Let player roll manually
                     break;
                 case RollMode.automaticDice:
-                    dm.GatherDice(new Vector3(-100, 5, 0), lastRollId);
-                    dm.ThrowDice(lastRollId);
+                    RollId.TryParse(lastRollId.ToString(), out RollId idLastroll);
+                    Vector3 spawnposition = new Vector3(diceSideExistance.position.x, diceSideExistance.position.y + ((rollingSystem == RollMode.automaticDice) ? 5 : 1), diceSideExistance.position.z);
+                    //dm.GatherDice(spawnposition, idLastroll);                             
+                    dm.ThrowDice(idLastroll, new Unity.Mathematics.float3(0f, 1f, 0f));                   
+                          
                     break;
                 case RollMode.automaticGenerator:
                     ResultDiceSet(ResolveRoll(loadedRollRequest.roll));                    
@@ -1384,11 +1514,14 @@ namespace LordAshes
                     break;
                 case RollMode.manual_side:
                     Utility.DisableProcessing(false);
-                    saveCamera.Apply(Camera.main.transform);
+                    //saveCamera.Apply(Camera.main.transform);
+                    CameraController.MoveToPosition(saveCamera.position,false);
+                    CameraController.LookAtTarget(instigator.TargetPosition);
+                    
                     saveCamera = null;
                     break;
                 case RollMode.automaticDice:
-                    GameObject dolly = GameObject.Find("dolly");
+                    //GameObject dolly = GameObject.Find("dolly");
                     GameObject.Destroy(dolly);
                     break;
                 case RollMode.automaticGenerator:
@@ -1398,7 +1531,7 @@ namespace LordAshes
             SyncDisNormAdv();
         }
 
-        public void NewDiceSet(int rollId)
+        public void NewDiceSet(long rollId)
         {
             switch (stateMachineState)
             {
@@ -1419,8 +1552,8 @@ namespace LordAshes
         }
 
         public void ResultDiceSet(Dictionary<string, object> result)
-        {
-            if ((lastRollId == (int)result["Identifier"]) || ((int)result["Identifier"] == -2))
+        {            
+            if ((lastRollId == (long)result["Identifier"]) || ((long)result["Identifier"] == -2))
             {
                 switch (stateMachineState)
                 {
@@ -1441,7 +1574,7 @@ namespace LordAshes
             }
             else
             {
-                if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Request '" + lastRollId + "' Result '" + result["Identifier"] + "'. Ignoring."); }
+                if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Request '" + lastRollId.ToString() + "' Result '" + result["Identifier"] + "'. Ignoring."); }
             }
         }
 
@@ -1508,14 +1641,24 @@ namespace LordAshes
                         int pick1 = ran.Next(1, sides + 1);
                         int pick2 = ran.Next(1, sides + 1);
                         int pick = pick1;
-                        if (totalAdv & sides==20) {pick = Math.Max(pick1, pick2); }
-                        if (totalDis & sides==20) {pick = Math.Min(pick1, pick2); }
+                        //XJ (2022/12/16) On DC Attack, get victim Adv or Dis.
+                        if (dcAttack)
+                        {
+                            if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin:  (victim_totalAdv) (victim_totalDis) | " + victim_totalAdv.ToString() + " | " + victim_totalDis.ToString()); }
+                            if (victim_totalAdv & sides == 20) { pick = Math.Max(pick1, pick2); }
+                            if (victim_totalDis & sides == 20) { pick = Math.Min(pick1, pick2); }
+                        }
+                        else
+                        {
+                            if (totalAdv & sides == 20) { pick = Math.Max(pick1, pick2); }
+                            if (totalDis & sides == 20) { pick = Math.Min(pick1, pick2); }
+                        }
                         //XJ: to create two rolls when adventage or disventage is selected. Only for d20 rolls.
                         //XJ: (2022/10/08) commented
                         //if (damageDieMultiplier == 1.0f)
                         //{
-                            rolls = rolls + pick + ",";
-                            total = total + pick;
+                        rolls = rolls + pick + ",";
+                        total = total + pick;
                         //}
                         //else
                         //{
@@ -1526,20 +1669,26 @@ namespace LordAshes
                         if (pick != 1) { min = false; }
                         if (pick != sides) { max = false; }
                         //XJ://(2022/10/06) Add:
-                        if ((totalAdv || totalDis) & sides == 20) { rolls = rolls + (rolls.Contains(pick2.ToString()) ? pick1 : pick2) + ",";}
+                        //XJ (2022/12/16) On DC Attack, get victim Adv or Dis.
+                        if (diagnostics >= DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin:  (victim_totalAdv) (victim_totalDis) | " + victim_totalAdv.ToString() + " | " + victim_totalDis.ToString()); }
+                        if (dcAttack) { if ((victim_totalAdv || victim_totalDis) & sides == 20) { rolls = rolls + (rolls.Contains(pick2.ToString()) ? pick1 : pick2) + ","; } }
+                        else { if ((totalAdv || totalDis) & sides == 20) { rolls = rolls + (rolls.Contains(pick2.ToString()) ? pick1 : pick2) + ","; } }
                         //XJ: To keep the two roll results obtained when adventage or disventage is selected. Only d20 rolls.
                     }
                     roll = roll.Substring(0, sPos + 1) + total + roll.Substring(ePos);
                     rolls = rolls.Substring(0, rolls.Length - 1) + "]";
                     int expPos = expanded.IndexOf(dice + "D" + sides);
                     expanded = expanded.Substring(0, expPos) + rolls + expanded.Substring(expPos + (dice.ToString() + "D" + sides.ToString()).Length);
+                    if (originalRoll != "0+0+0") {expanded = expanded.Replace("+0+0", "+0"); }
                 }
                 DataTable dt = new DataTable();
                 Dictionary<string, object> results = new Dictionary<string, object>();
-                results.Add("Identifier", -2);
-                results.Add("Roll", originalRoll.Substring(2).Substring(0, originalRoll.Substring(2).Length - 2));
+                results.Add("Identifier", (long)-2);
+                results.Add("Roll", originalRoll.Substring(2).Substring(0, originalRoll.Substring(2).Length - 2).Replace("D","d").Replace("+0",""));
                 results.Add("Total", (int)dt.Compute(roll, null));
-                results.Add("Expanded", expanded.Substring(2).Substring(0, expanded.Substring(2).Length - 2));
+                expanded = expanded.Substring(2).Substring(0, expanded.Substring(2).Length - 2);
+                expanded = "+-".Contains(expanded.Substring(0,1))?expanded.Substring(1): expanded;
+                results.Add("Expanded",expanded) ;
                 results.Add("IsMax", (bool)max);
                 results.Add("IsMin", (bool)min);
                 return results;
@@ -1547,7 +1696,7 @@ namespace LordAshes
             catch (Exception e)
             {
                 Dictionary<string, object> results = new Dictionary<string, object>();
-                results.Add("Identifier", -2);
+                results.Add("Identifier", (long)-2);
                 results.Add("Roll", roll.Substring(2).Substring(0, roll.Substring(2).Length - 2));
                 results.Add("Total", 0);
                 results.Add("Expanded", e.Message);

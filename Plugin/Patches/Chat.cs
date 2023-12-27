@@ -46,11 +46,16 @@ namespace LordAshes //XJ: (2022/11/27)  Add: Replace(" ","\x255") to avoid playe
         /// </summary>
         /// <param name="creature">Speaking creature</param>
         /// <param name="text">Content to be spoken</param>
+
         public static void SpeakEx(this CreatureBoardAsset creature, string text)
+        {    
+                AssetDataPlugin.SendInfo(RuleSet5EPlugin.Guid + ".Bubble",creature.CreatureId.ToString() +"|"+ text); ////XJ(2023/02/23) All players can see Bubbles.
+        }
+        public static void SpeakExMessage(this CreatureBoardAsset creature, string text)
         {
             if(LordAshes.RuleSet5EPlugin.rollingSystem != RuleSet5EPlugin.RollMode.manual_side)
             {
-                creature.Speak(text);               
+                creature.Speak(text);              
             }
             else
             {
@@ -68,24 +73,27 @@ namespace LordAshes //XJ: (2022/11/27)  Add: Replace(" ","\x255") to avoid playe
         /// <param name="speaker">Guid of the speaker</param>
         public static void SendChatMessageEx(this ChatManager chatManager, string playersMessage, string ownerMessage, string gmMessage, CreatureGuid subject, NGuid speaker)
         {
-            List<string> gms = RuleSet5EPlugin.Utility.FindGMs();
-            List<string> owners = RuleSet5EPlugin.Utility.FindOwners(subject);
+            List<PlayerGuid> gms = RuleSet5EPlugin.Utility.FindGMs();
+            List<PlayerGuid> owners = RuleSet5EPlugin.Utility.FindOwners(subject);
             if (gmMessage!=null)
             {
-                foreach (string gmName in gms)
+                foreach (PlayerGuid gmName in gms)
                 {
-                    if (LordAshes.RuleSet5EPlugin.diagnostics >= LordAshes.RuleSet5EPlugin.DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Chat Extension: Sending Chat Message To GM '" + gmName + "' Content: " + gmMessage.Replace("\r\n", "|")); }               
-                    ChatManager.SendChatMessage("/w " + gmName.Replace(" ","\x255") + " " + gmMessage, speaker);
+                    if (LordAshes.RuleSet5EPlugin.diagnostics >= LordAshes.RuleSet5EPlugin.DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Chat Extension: Sending Chat Message To GM '" + gmName + "' Content: " + gmMessage.Replace("\r\n", "|")); }
+                    // ChatManager.SendChatMessage("/w " + gmName.Replace(" ","\x255") + " " + gmMessage, speaker);                    
+                    ChatManager.SendChatMessageToGms(gmMessage, speaker);
                 }
             }
             if(ownerMessage!=null)
             {
-                foreach (string ownerName in owners)
+                foreach (PlayerGuid ownerName in owners)
                 {
                     if (!gms.Contains(ownerName))
                     {
                         if (LordAshes.RuleSet5EPlugin.diagnostics >= LordAshes.RuleSet5EPlugin.DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Chat Extension: Sending Chat Message To Owner '" + ownerName + "' Content: " + gmMessage.Replace("\r\n", "|")); }
-                        ChatManager.SendChatMessage("/w " + ownerName.Replace(" ","\x255") + " " + ownerMessage, speaker);
+                        // ChatManager.SendChatMessage("/w " + ownerName.Replace(" ","\x255") + " " + ownerMessage, speaker);
+                        
+                        ChatManager.SendChatMessageToPlayer(ownerMessage, ownerName, speaker);
                     }
                 }
             }
@@ -93,11 +101,12 @@ namespace LordAshes //XJ: (2022/11/27)  Add: Replace(" ","\x255") to avoid playe
             {
                 foreach (PlayerGuid pid in CampaignSessionManager.PlayersInfo.Keys)
                 {
-                    string playerName = CampaignSessionManager.GetPlayerName(pid);
-                    if (!gms.Contains(playerName) && !owners.Contains(playerName))
+                    //string playerName = CampaignSessionManager.GetPlayerName(pid);
+                    if (!gms.Contains(pid) && !owners.Contains(pid))
                     {
                         if (LordAshes.RuleSet5EPlugin.diagnostics >= LordAshes.RuleSet5EPlugin.DiagnosticMode.ultra) { Debug.Log("RuleSet 5E Plugin: Chat Extension: Sending Chat Message To Player '" + CampaignSessionManager.GetPlayerName(pid) + "' Content: " + playersMessage.Replace("\r\n", "|")); }
-                        ChatManager.SendChatMessage("/w "+ CampaignSessionManager.GetPlayerName(pid).Replace(" ","\x255") + " "+playersMessage, speaker);
+                        //ChatManager.SendChatMessage("/w "+ CampaignSessionManager.GetPlayerName(pid).Replace(" ","\x255") + " "+playersMessage, speaker);
+                        ChatManager.SendChatMessageToPlayer(playersMessage,pid, speaker);  
                     }
                 }
             }

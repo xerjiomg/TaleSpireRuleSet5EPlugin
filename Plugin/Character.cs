@@ -86,9 +86,13 @@ namespace LordAshes
             public bool _useAttackBonusDie { get; set; } =false;
             public bool _useDamageBonusDie { get; set; } = false;
             public bool _useSkillBonusDie { get; set; } = false;
+            public bool _useACBonusDie { get; set; } = false;
             public string _amountAttackBonusDie { get; set; } = "";
             public string _amountDamageBonusDie { get; set; } = "";
             public string _amountSkillBonusDie { get; set; } = "";
+            public string _amountACBonusDie { get; set; } = "";
+            public bool _useAdv { get; set; } = false;
+            public bool _useDis { get; set; } = false;
         }
     }
 }
